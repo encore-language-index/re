@@ -1,0 +1,10 @@
+[project]
+encore = ">=0.1.6"
+name = "re"
+version = "0.0.0"
+description = "Compiled UTF-8 regular expressions with ASCII classes and bounded search complexity"
+readme = "README.md"
+licence = "MIT"
+dependencies = [
+    "sys@core",
+]

@@ -1,0 +1,1310 @@
+//! Compiled UTF-8 regular expressions with ASCII shorthand classes.
+import core::fmt::Debug
+import core::iter::{IntoIterator, Iterator}
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+
+/// Compile-time flags. All flags are disabled by default.
+pub struct RegexOptions {
+    ignore_case: bool
+    multi_line: bool
+    dot_matches_new_line: bool
+}
+
+impl for RegexOptions {
+    pub fn new() -> Self {
+        ret Self { false, false, false }
+    }
+
+    pub fn with_ignore_case(self: Self, enabled: bool) -> Self {
+        ret Self { enabled, self.multi_line, self.dot_matches_new_line }
+    }
+
+    pub fn with_multi_line(self: Self, enabled: bool) -> Self {
+        ret Self { self.ignore_case, enabled, self.dot_matches_new_line }
+    }
+
+    pub fn with_dot_matches_new_line(self: Self, enabled: bool) -> Self {
+        ret Self { self.ignore_case, self.multi_line, enabled }
+    }
+}
+
+/// A malformed or excessively large pattern; position is a UTF-8 byte offset.
+pub struct RegexError {
+    message: str
+    position: usize
+}
+
+impl for RegexError {
+    pub fn message(self: Self) -> str {
+        ret self.message
+    }
+    pub fn position(self: Self) -> usize {
+        ret self.position
+    }
+}
+
+impl Debug for RegexError {
+    pub fn fmt(self: Self) -> str {
+        ret f"regex byte {self.position}: {self.message}"
+    }
+}
+
+/// Retains the input, without copying a substring until as_str() is requested.
+pub struct Match {
+    text: str
+    first: usize
+    last: usize
+}
+
+impl for Match {
+    pub fn start(self: Self) -> usize {
+        ret self.first
+    }
+    pub fn end(self: Self) -> usize {
+        ret self.last
+    }
+    pub fn as_str(self: Self) -> str {
+        ret self.text.slice_bytes(self.first, self.last - self.first)
+    }
+}
+
+struct Range {
+    low: usize
+    high: usize
+}
+struct CharClass {
+    ranges: Vec[Range]
+    mask0: u32
+    mask1: u32
+    mask2: u32
+    mask3: u32
+}
+
+// AST kinds: empty, class, dot, assertion, concatenation, alternative, repeat.
+// Each node's cost bounds expanded compilation work, including empty repeats.
+struct Ast {
+    kind: usize
+    left: usize
+    right: usize
+    minimum: usize
+    maximum: usize
+    lazy: bool
+    literal: usize
+    cost: usize
+}
+
+struct Parser {
+    source: str
+    cursor: usize
+    depth: usize
+    options: RegexOptions
+    nodes: Vec[Ast]
+    classes: Vec[CharClass]
+}
+
+// Instruction kinds: accept, class, dot, assertion, ordered split.
+struct Inst {
+    kind: usize
+    a: usize
+    b: usize
+}
+
+struct StartSet {
+    mask0: u32
+    mask1: u32
+    mask2: u32
+    mask3: u32
+    non_ascii: bool
+    nullable: bool
+}
+struct Task {
+    kind: usize
+    node: usize
+    next: usize
+    saved: usize
+    optional: usize
+    required: usize
+    lazy: bool
+}
+
+/// Immutable compiled program. Copies share read-only program storage.
+pub struct Regex {
+    program: Vec[Inst]
+    classes: Vec[CharClass]
+    entry: usize
+    options: RegexOptions
+    prefix: Vec[u8]
+    failure: Vec[usize]
+    literal_only: bool
+    first: StartSet
+}
+
+struct Thread {
+    pc: usize
+    start: usize
+}
+
+/// Mutable search workspace. Use a separate matcher for each concurrent search.
+pub struct Matcher {
+    regex: Regex
+    current: Vec[Thread]
+    next: Vec[Thread]
+    stack: Vec[Thread]
+    seen: Vec[usize]
+    generation: usize
+}
+
+/// A lazy iterator retaining its input and reusing one search workspace.
+pub struct FindIter {
+    workspace: Matcher<H>
+    text: str
+    cursor: usize
+    finished: bool
+}
+
+fn error(message: str, position: usize) -> RegexError {
+    ret RegexError { message, position }
+}
+
+fn fold(byte: u8) -> u8 {
+    if byte >= 65_u8 && byte <= 90_u8 {
+        ret byte + 32_u8
+    }
+    ret byte
+}
+
+fn word(byte: u8) -> bool {
+    ret(byte >= 65_u8 && byte <= 90_u8) ||
+    (byte >= 97_u8 && byte <= 122_u8) ||
+    (byte >= 48_u8 && byte <= 57_u8) || byte == 95_u8
+}
+
+// Reads one scalar in O(1). Invalid UTF-8 bytes consume one byte as U+FFFD.
+fn decode(text: str, position: usize) ->(usize, usize) {
+    let size = text.byte_len()
+    if position >= size {
+        ret(0_usize, position)
+    }
+    let first = text.byte_at(position) as usize
+    if first < 128_usize {
+        ret(first, position + 1_usize)
+    }
+    let mut width = 0_usize
+    let mut value = 0_usize
+    let mut minimum = 0_usize
+    if first >= 194_usize && first <= 223_usize {
+        width = 2_usize
+        value = first - 192_usize
+        minimum = 128_usize
+    } elif first >= 224_usize && first <= 239_usize {
+        width = 3_usize
+        value = first - 224_usize
+        minimum = 2048_usize
+    } elif first >= 240_usize && first <= 244_usize {
+        width = 4_usize
+        value = first - 240_usize
+        minimum = 65536_usize
+    } else {
+        ret(65533_usize, position + 1_usize)
+    }
+    if width > size - position {
+        ret(65533_usize, position + 1_usize)
+    }
+    let mut i = 1_usize
+    while i < width {
+        let byte = text.byte_at(position + i) as usize
+        if byte < 128_usize || byte > 191_usize {
+            ret(65533_usize, position + 1_usize)
+        }
+        value = value * 64_usize + byte - 128_usize
+        i += 1_usize
+    }
+    if value < minimum || value > 1114111_usize ||
+    (value >= 55296_usize && value <= 57343_usize) {
+        ret(65533_usize, position + 1_usize)
+    }
+    ret(value, position + width)
+}
+
+fn encode(bytes: mut Vec[u8], value: usize) ->() {
+    if value < 128_usize {
+        bytes.push(value as u8)
+    } elif value < 2048_usize {
+        bytes.push((192_usize + value / 64_usize) as u8)
+        bytes.push((128_usize + value % 64_usize) as u8)
+    } elif value < 65536_usize {
+        bytes.push((224_usize + value / 4096_usize) as u8)
+        bytes.push((128_usize + value / 64_usize % 64_usize) as u8)
+        bytes.push((128_usize + value % 64_usize) as u8)
+    } else {
+        bytes.push((240_usize + value / 262144_usize) as u8)
+        bytes.push((128_usize + value / 4096_usize % 64_usize) as u8)
+        bytes.push((128_usize + value / 64_usize % 64_usize) as u8)
+        bytes.push((128_usize + value % 64_usize) as u8)
+    }
+}
+
+fn range_less(a: Range, b: Range) -> bool {
+    ret a.low < b.low ||(a.low == b.low && a.high < b.high)
+}
+
+fn sift(ranges: mut Vec[Range], first: usize, length: usize) ->() {
+    let mut root = first
+    while root < length / 2_usize {
+        let mut child = root * 2_usize + 1_usize
+        if child + 1_usize < length &&
+        range_less(ranges.get_unchecked_borrowed(child), ranges.get_unchecked_borrowed(child + 1_usize)) {
+            child += 1_usize
+        }
+        let parent = ranges.get_unchecked_borrowed(root)
+        let larger = ranges.get_unchecked_borrowed(child)
+        if !range_less(parent, larger) {
+            ret()
+        }
+        ranges.set(root, larger)
+        ranges.set(child, parent)
+        root = child
+    }
+}
+
+fn normalize(ranges: mut Vec[Range]) -> Vec[Range] {
+    let mut root = ranges.len() / 2_usize
+    while root > 0_usize {
+        root -= 1_usize
+        sift(ranges, root, ranges.len())
+    }
+    let mut end = ranges.len()
+    while end > 1_usize {
+        end -= 1_usize
+        let value = ranges.get_unchecked_borrowed(0_usize)
+        ranges.set(0_usize, ranges.get_unchecked_borrowed(end))
+        ranges.set(end, value)
+        sift(ranges, 0_usize, end)
+    }
+    let mut merged = Vec[Range]::with_capacity(ranges.len())
+    for item in ranges {
+        if merged.len() == 0_usize {
+            merged.push(item)
+        } else {
+            let last = merged.get_unchecked_borrowed(merged.len() - 1_usize)
+            if item.low <= last.high + 1_usize {
+                let mut high = last.high
+                if item.high > high {
+                    high = item.high
+                }
+                merged.set(merged.len() - 1_usize, Range { last.low, high })
+            } else {
+                merged.push(item)
+            }
+        }
+    }
+    ret merged
+}
+
+fn complement(ranges: Vec[Range]) -> Vec[Range] {
+    let mut out = Vec[Range]::with_capacity(ranges.len() + 1_usize)
+    let mut next = 0_usize
+    for item in ranges {
+        if next < item.low {
+            out.push(Range { next, item.low - 1_usize })
+        }
+        next = item.high + 1_usize
+    }
+    if next <= 1114111_usize {
+        out.push(Range { next, 1114111_usize })
+    }
+    ret out
+}
+
+fn contains(ranges: Vec[Range], value: usize) -> bool {
+    let mut low = 0_usize
+    let mut high = ranges.len()
+    while low < high {
+        let mid = low +(high - low) / 2_usize
+        let item = ranges.get_unchecked_borrowed(mid)
+        if value < item.low {
+            high = mid
+        } elif value > item.high {
+            low = mid + 1_usize
+        } else {
+            ret true
+        }
+    }
+    ret false
+}
+
+fn class_matches(class: CharClass, value: usize) -> bool {
+    if value < 128_usize {
+        let mut mask = class.mask0
+        if value >= 96_usize {
+            mask = class.mask3
+        } elif value >= 64_usize {
+            mask = class.mask2
+        } elif value >= 32_usize {
+            mask = class.mask1
+        }
+        ret(mask &(1_u32 <<(value % 32_usize))) != 0_u32
+    }
+    ret contains(class.ranges, value)
+}
+
+fn build_class(ranges: mut Vec[Range], inverted: bool, ignore_case: bool) -> CharClass {
+    if ignore_case {
+        let length = ranges.len()
+        let mut i = 0_usize
+        while i < length {
+            let item = ranges.get_unchecked_borrowed(i)
+            if item.low <= 90_usize && item.high >= 65_usize {
+                let mut low = item.low
+                let mut high = item.high
+                if low < 65_usize {
+                    low = 65_usize
+                }
+                if high > 90_usize {
+                    high = 90_usize
+                }
+                ranges.push(Range { low + 32_usize, high + 32_usize })
+            }
+            if item.low <= 122_usize && item.high >= 97_usize {
+                let mut low = item.low
+                let mut high = item.high
+                if low < 97_usize {
+                    low = 97_usize
+                }
+                if high > 122_usize {
+                    high = 122_usize
+                }
+                ranges.push(Range { low - 32_usize, high - 32_usize })
+            }
+            i += 1_usize
+        }
+    }
+    let mut final_ranges = normalize(ranges)
+    if inverted {
+        final_ranges = complement(final_ranges)
+    }
+    let mut mask0 = 0_u32
+    let mut mask1 = 0_u32
+    let mut mask2 = 0_u32
+    let mut mask3 = 0_u32
+    let mut value = 0_usize
+    while value < 128_usize {
+        if contains(final_ranges, value) {
+            let bit = 1_u32 <<(value % 32_usize)
+            if value < 32_usize {
+                mask0 = mask0 | bit
+            } elif value < 64_usize {
+                mask1 = mask1 | bit
+            } elif value < 96_usize {
+                mask2 = mask2 | bit
+            } else {
+                mask3 = mask3 | bit
+            }
+        }
+        value += 1_usize
+    }
+    ret CharClass { final_ranges, mask0, mask1, mask2, mask3 }
+}
+
+fn shorthand(code: usize) -> Vec[Range] {
+    let mut ranges = Vec[Range]::new()
+    if code == 100_usize || code == 68_usize {
+        ranges.push(Range { 48_usize, 57_usize })
+    } elif code == 119_usize || code == 87_usize {
+        ranges.push(Range { 48_usize, 57_usize })
+        ranges.push(Range { 65_usize, 90_usize })
+        ranges.push(Range { 95_usize, 95_usize })
+        ranges.push(Range { 97_usize, 122_usize })
+    } else {
+        ranges.push(Range { 9_usize, 13_usize })
+        ranges.push(Range { 32_usize, 32_usize })
+    }
+    if code == 68_usize || code == 87_usize || code == 83_usize {
+        ret complement(ranges)
+    }
+    ret ranges
+}
+
+impl for Parser {
+    fn peek(self: Self&) -> usize {
+        if self.cursor >= self.source.byte_len() {
+            ret 256_usize
+        }
+        ret self.source.byte_at(self.cursor) as usize
+    }
+
+    fn add(self: mut Self&, node: Ast) -> Result[usize, RegexError] {
+        if node.cost > 65536_usize || self.nodes.len() >= 65536_usize {
+            ret Result::Err(error("expanded pattern exceeds compilation limit", self.cursor))
+        }
+        let index = self.nodes.len()
+        self.nodes.push(node)
+        ret Result::Ok(index)
+    }
+
+    fn atom_node(self: mut Self&, kind: usize, argument: usize, literal: usize) -> Result[usize, RegexError] {
+        ret self.add(Ast { kind, argument, 0_usize, 0_usize, 0_usize, false, literal, 1_usize })
+    }
+
+    fn binary(self: mut Self&, kind: usize, left: usize, right: usize) -> Result[usize, RegexError] {
+        let cost = 1_usize + self.nodes.get_unchecked_borrowed(left).cost + self.nodes.get_unchecked_borrowed(right).cost
+        ret self.add(Ast { kind, left, right, 0_usize, 0_usize, false, 1114112_usize, cost })
+    }
+
+    fn class_node(self: mut Self&, ranges: mut Vec[Range], inverted: bool, literal: usize) -> Result[usize, RegexError] {
+        let index = self.classes.len()
+        self.classes.push(build_class(ranges, inverted, self.options.ignore_case))
+        ret self.atom_node(1_usize, index, literal)
+    }
+
+    fn literal_node(self: mut Self&, value: usize) -> Result[usize, RegexError] {
+        let mut ranges = Vec[Range]::singleton(Range { value, value })
+        ret self.class_node(ranges, false, value)
+    }
+
+    fn hex(self: mut Self&, braced: bool) -> Result[usize, RegexError] {
+        let start = self.cursor
+        if braced {
+            if self.peek() != 123_usize {
+                ret Result::Err(error("expected { after \\u", start))
+            }
+            self.cursor += 1_usize
+        }
+        let mut value = 0_usize
+        let mut digits = 0_usize
+        while self.cursor < self.source.byte_len() {
+            let byte = self.peek()
+            if braced && byte == 125_usize {
+                break
+            }
+            if !braced && digits == 2_usize {
+                break
+            }
+            let mut digit = 16_usize
+            if byte >= 48_usize && byte <= 57_usize {
+                digit = byte - 48_usize
+            } elif byte >= 65_usize && byte <= 70_usize {
+                digit = byte - 55_usize
+            } elif byte >= 97_usize && byte <= 102_usize {
+                digit = byte - 87_usize
+            }
+            if digit == 16_usize || digits >= 6_usize {
+                ret Result::Err(error("invalid hexadecimal escape", self.cursor))
+            }
+            value = value * 16_usize + digit
+            digits += 1_usize
+            self.cursor += 1_usize
+        }
+        if braced {
+            if self.peek() != 125_usize || digits == 0_usize {
+                ret Result::Err(error("unterminated Unicode escape", start))
+            }
+            self.cursor += 1_usize
+        } elif digits != 2_usize {
+            ret Result::Err(error("expected two hexadecimal digits", start))
+        }
+        if value > 1114111_usize ||(value >= 55296_usize && value <= 57343_usize) {
+            ret Result::Err(error("escape is not a Unicode scalar", start))
+        }
+        ret Result::Ok(value)
+    }
+
+    // Escape kinds: scalar, shorthand class, zero-width assertion.
+    fn escape(self: mut Self&, in_class: bool) -> Result[(usize, usize), RegexError] {
+        let start = self.cursor
+        self.cursor += 1_usize
+        if self.cursor >= self.source.byte_len() {
+            ret Result::Err(error("trailing backslash", start))
+        }
+        let code = self.peek()
+        self.cursor += 1_usize
+        if code == 100_usize || code == 68_usize || code == 119_usize ||
+        code == 87_usize || code == 115_usize || code == 83_usize {
+            ret Result::Ok((1_usize, code))
+        }
+        if code == 110_usize {
+            ret Result::Ok((0_usize, 10_usize))
+        }
+        if code == 114_usize {
+            ret Result::Ok((0_usize, 13_usize))
+        }
+        if code == 116_usize {
+            ret Result::Ok((0_usize, 9_usize))
+        }
+        if code == 102_usize {
+            ret Result::Ok((0_usize, 12_usize))
+        }
+        if code == 118_usize {
+            ret Result::Ok((0_usize, 11_usize))
+        }
+        if code == 97_usize {
+            ret Result::Ok((0_usize, 7_usize))
+        }
+        if code == 48_usize {
+            ret Result::Ok((0_usize, 0_usize))
+        }
+        if code == 120_usize {
+            ret Result::Ok((0_usize, self.hex(false)?))
+        }
+        if code == 117_usize {
+            ret Result::Ok((0_usize, self.hex(true)?))
+        }
+        if code == 98_usize {
+            if in_class {
+                ret Result::Ok((0_usize, 8_usize))
+            }
+            ret Result::Ok((2_usize, 4_usize))
+        }
+        if !in_class && code == 66_usize {
+            ret Result::Ok((2_usize, 5_usize))
+        }
+        if !in_class && code == 65_usize {
+            ret Result::Ok((2_usize, 2_usize))
+        }
+        if !in_class && code == 122_usize {
+            ret Result::Ok((2_usize, 3_usize))
+        }
+        if code < 128_usize && !word(code as u8) && code >= 33_usize && code <= 126_usize {
+            ret Result::Ok((0_usize, code))
+        }
+        ret Result::Err(error("unsupported escape (no backreferences or Unicode properties)", start))
+    }
+
+    fn class_item(self: mut Self&) -> Result[(usize, usize), RegexError] {
+        if self.peek() == 92_usize {
+            ret self.escape(true)
+        }
+        let scalar = decode(self.source, self.cursor)
+        self.cursor = scalar.1
+        ret Result::Ok((0_usize, scalar.0))
+    }
+
+    fn bracket(self: mut Self&) -> Result[usize, RegexError] {
+        let start = self.cursor
+        self.cursor += 1_usize
+        let inverted = self.peek() == 94_usize
+        if inverted {
+            self.cursor += 1_usize
+        }
+        let mut ranges = Vec[Range]::new()
+        while self.cursor < self.source.byte_len() && self.peek() != 93_usize {
+            let item = self.class_item()?
+            if self.peek() == 45_usize && self.cursor + 1_usize < self.source.byte_len() &&
+            self.source.byte_at(self.cursor + 1_usize) != 93_u8 {
+                self.cursor += 1_usize
+                let last = self.class_item()?
+                if item.0 != 0_usize || last.0 != 0_usize || item.1 > last.1 {
+                    ret Result::Err(error("range requires two ordered scalar endpoints", self.cursor))
+                }
+                ranges.push(Range { item.1, last.1 })
+            } elif item.0 == 1_usize {
+                for range in shorthand(item.1) {
+                    ranges.push(range)
+                }
+            } else {
+                ranges.push(Range { item.1, item.1 })
+            }
+        }
+        if self.peek() != 93_usize {
+            ret Result::Err(error("unclosed character class", start))
+        }
+        if ranges.len() == 0_usize {
+            ret Result::Err(error("empty character class", start))
+        }
+        self.cursor += 1_usize
+        ret self.class_node(ranges, inverted, 1114112_usize)
+    }
+
+    fn atom(self: mut Self&) -> Result[usize, RegexError] {
+        let start = self.cursor
+        let code = self.peek()
+        if code == 40_usize {
+            self.cursor += 1_usize
+            if self.peek() == 63_usize {
+                self.cursor += 1_usize
+                if self.peek() != 58_usize {
+                    ret Result::Err(error("only (...) and (?:...) groups are supported", start))
+                }
+                self.cursor += 1_usize
+            }
+            if self.depth >= 128_usize {
+                ret Result::Err(error("group nesting exceeds 128", start))
+            }
+            self.depth += 1_usize
+            let node = self.alternative()?
+            self.depth -= 1_usize
+            if self.peek() != 41_usize {
+                ret Result::Err(error("unclosed group", start))
+            }
+            self.cursor += 1_usize
+            ret Result::Ok(node)
+        }
+        if code == 91_usize {
+            ret self.bracket()
+        }
+        if code == 92_usize {
+            let escaped = self.escape(false)?
+            if escaped.0 == 1_usize {
+                let mut ranges = shorthand(escaped.1)
+                ret self.class_node(ranges, false, 1114112_usize)
+            }
+            if escaped.0 == 2_usize {
+                ret self.atom_node(3_usize, escaped.1, 1114112_usize)
+            }
+            ret self.literal_node(escaped.1)
+        }
+        self.cursor += 1_usize
+        if code == 46_usize {
+            ret self.atom_node(2_usize, 0_usize, 1114112_usize)
+        }
+        if code == 94_usize {
+            ret self.atom_node(3_usize, 0_usize, 1114112_usize)
+        }
+        if code == 36_usize {
+            ret self.atom_node(3_usize, 1_usize, 1114112_usize)
+        }
+        if code == 42_usize || code == 43_usize || code == 63_usize || code == 123_usize {
+            ret Result::Err(error("repetition has no preceding expression", start))
+        }
+        if code == 93_usize || code == 125_usize {
+            ret Result::Err(error("unexpected closing delimiter", start))
+        }
+        let scalar = decode(self.source, start)
+        self.cursor = scalar.1
+        ret self.literal_node(scalar.0)
+    }
+
+    fn number(self: mut Self&) -> Result[usize, RegexError] {
+        let start = self.cursor
+        let mut number = 0_usize
+        while self.peek() >= 48_usize && self.peek() <= 57_usize {
+            number = number * 10_usize + self.peek() - 48_usize
+            if number > 65536_usize {
+                ret Result::Err(error("repetition count exceeds 65536", start))
+            }
+            self.cursor += 1_usize
+        }
+        if self.cursor == start {
+            ret Result::Err(error("expected repetition count", start))
+        }
+        ret Result::Ok(number)
+    }
+
+    fn repeated(self: mut Self&) -> Result[usize, RegexError] {
+        let child = self.atom()?
+        let code = self.peek()
+        if code != 42_usize && code != 43_usize && code != 63_usize && code != 123_usize {
+            ret Result::Ok(child)
+        }
+        let start = self.cursor
+        if self.nodes.get_unchecked_borrowed(child).kind == 3_usize {
+            ret Result::Err(error("cannot repeat a zero-width assertion", start))
+        }
+        self.cursor += 1_usize
+        let mut minimum = 0_usize
+        let mut maximum = 65537_usize
+        if code == 43_usize {
+            minimum = 1_usize
+        }
+        if code == 63_usize {
+            maximum = 1_usize
+        }
+        if code == 123_usize {
+            minimum = self.number()?
+            maximum = minimum
+            if self.peek() == 44_usize {
+                self.cursor += 1_usize
+                maximum = 65537_usize
+                if self.peek() != 125_usize {
+                    maximum = self.number()?
+                }
+            }
+            if self.peek() != 125_usize {
+                ret Result::Err(error("unclosed repetition", start))
+            }
+            self.cursor += 1_usize
+            if maximum < minimum {
+                ret Result::Err(error("repetition maximum is smaller than minimum", start))
+            }
+        }
+        let lazy = self.peek() == 63_usize
+        if lazy {
+            self.cursor += 1_usize
+        }
+        let next = self.peek()
+        if next == 42_usize || next == 43_usize || next == 63_usize || next == 123_usize {
+            ret Result::Err(error("stacked or possessive repetition is unsupported", self.cursor))
+        }
+        let mut copies = maximum
+        if maximum == 65537_usize {
+            copies = minimum + 1_usize
+        }
+        let cost = self.nodes.get_unchecked_borrowed(child).cost + 1_usize
+        if copies > 65535_usize / cost {
+            ret Result::Err(error("expanded repetition exceeds compilation limit", start))
+        }
+        ret self.add(Ast {
+                6_usize, child, 0_usize, minimum, maximum, lazy, 1114112_usize, copies * cost + 1_usize
+            }
+        )
+    }
+
+    fn sequence(self: mut Self&) -> Result[usize, RegexError] {
+        let mut nodes = Vec[usize]::new()
+        while self.cursor < self.source.byte_len() && self.peek() != 41_usize && self.peek() != 124_usize {
+            nodes.push(self.repeated()?)
+        }
+        if nodes.len() == 0_usize {
+            ret self.atom_node(0_usize, 0_usize, 1114112_usize)
+        }
+        let mut root = nodes.get_unchecked_borrowed(nodes.len() - 1_usize)
+        let mut index = nodes.len() - 1_usize
+        while index > 0_usize {
+            index -= 1_usize
+            root = self.binary(4_usize, nodes.get_unchecked_borrowed(index), root)?
+        }
+        ret Result::Ok(root)
+    }
+
+    pub fn alternative(self: mut Self&) -> Result[usize, RegexError] {
+        let mut root = self.sequence()?
+        while self.peek() == 124_usize {
+            self.cursor += 1_usize
+            let right = self.sequence()?
+            root = self.binary(5_usize, root, right)?
+        }
+        ret Result::Ok(root)
+    }
+}
+
+fn task(kind: usize, node: usize, next: usize) -> Task {
+    ret Task { kind, node, next, 0_usize, 0_usize, 0_usize, false }
+}
+
+fn split(program: mut Vec[Inst], body: usize, exit: usize, lazy: bool) -> usize {
+    let index = program.len()
+    if lazy {
+        program.push(Inst { 4_usize, exit, body })
+    } else {
+        program.push(Inst { 4_usize, body, exit })
+    }
+    ret index
+}
+
+// Continuation-passing compilation with an explicit stack, including repeats.
+fn compile(nodes: Vec[Ast], root: usize) ->(Vec[Inst], usize) {
+    let mut program = Vec[Inst]::with_capacity(nodes.get_unchecked_borrowed(root).cost)
+    program.push(Inst { 0_usize, 0_usize, 0_usize })
+    let mut tasks = Vec[Task]::new()
+    tasks.push(task(0_usize, root, 0_usize))
+    let mut result = 0_usize
+    while tasks.len() > 0_usize {
+        let step = tasks.pop().unwrap_or(task(0_usize, 0_usize, 0_usize))
+        if step.kind == 1_usize {
+            tasks.push(task(0_usize, step.node, result))
+        } elif step.kind == 2_usize {
+            let mut after = task(3_usize, 0_usize, step.next)
+            after.saved = result
+            tasks.push(after)
+            tasks.push(task(0_usize, step.node, step.next))
+        } elif step.kind == 3_usize {
+            result = split(program, step.saved, result, false)
+        } elif step.kind == 4_usize {
+            let mut remaining = step
+            if step.optional > 0_usize {
+                remaining.kind = 5_usize
+                remaining.optional -= 1_usize
+                tasks.push(remaining)
+                tasks.push(task(0_usize, step.node, step.next))
+            } elif step.required > 0_usize {
+                remaining.kind = 6_usize
+                remaining.required -= 1_usize
+                tasks.push(remaining)
+                tasks.push(task(0_usize, step.node, step.next))
+            } else {
+                result = step.next
+            }
+        } elif step.kind == 5_usize || step.kind == 6_usize {
+            let mut remaining = step
+            remaining.kind = 4_usize
+            remaining.next = result
+            if step.kind == 5_usize {
+                remaining.next = split(program, result, step.next, step.lazy)
+            }
+            tasks.push(remaining)
+        } elif step.kind == 7_usize {
+            if step.lazy {
+                program.set(step.saved, Inst { 4_usize, step.next, result })
+            } else {
+                program.set(step.saved, Inst { 4_usize, result, step.next })
+            }
+            let mut remaining = step
+            remaining.kind = 4_usize
+            remaining.next = step.saved
+            tasks.push(remaining)
+        } else {
+            let node = nodes.get_unchecked_borrowed(step.node)
+            if node.kind == 0_usize {
+                result = step.next
+            } elif node.kind <= 3_usize {
+                result = program.len()
+                program.push(Inst { node.kind, node.left, step.next })
+            } elif node.kind == 4_usize {
+                tasks.push(task(1_usize, node.left, step.next))
+                tasks.push(task(0_usize, node.right, step.next))
+            } elif node.kind == 5_usize {
+                tasks.push(task(2_usize, node.right, step.next))
+                tasks.push(task(0_usize, node.left, step.next))
+            } else {
+                let mut repeat = task(4_usize, node.left, step.next)
+                repeat.required = node.minimum
+                repeat.lazy = node.lazy
+                if node.maximum == 65537_usize {
+                    repeat.kind = 7_usize
+                    repeat.saved = split(program, step.next, step.next, false)
+                    tasks.push(repeat)
+                    tasks.push(task(0_usize, node.left, repeat.saved))
+                } else {
+                    repeat.optional = node.maximum - node.minimum
+                    tasks.push(repeat)
+                }
+            }
+        }
+    }
+    ret(program, result)
+}
+
+fn literal_prefix(nodes: Vec[Ast], root: usize, ignore_case: bool) ->(Vec[u8], bool) {
+    let mut bytes = Vec[u8]::new()
+    let mut stack = Vec[usize]::new()
+    stack.push(root)
+    let mut literal_only = true
+    while stack.len() > 0_usize {
+        let index = stack.pop().unwrap_or(root)
+        let node = nodes.get_unchecked_borrowed(index)
+        if node.kind == 4_usize {
+            stack.push(node.right)
+            stack.push(node.left)
+        } elif node.kind == 1_usize && node.literal <= 1114111_usize {
+            let mut value = node.literal
+            if ignore_case && value < 128_usize {
+                value = fold(value as u8) as usize
+            }
+            encode(bytes, value)
+        } elif node.kind == 3_usize {
+            literal_only = false
+        } elif node.kind != 0_usize {
+            ret(bytes, false)
+        }
+    }
+    ret(bytes, literal_only)
+}
+
+fn failure_table(bytes: Vec[u8]) -> Vec[usize] {
+    let mut table = Vec[usize]::with_capacity(bytes.len())
+    let mut length = 0_usize
+    let mut index = 0_usize
+    while index < bytes.len() {
+        if index > 0_usize {
+            let byte = bytes.get_unchecked_borrowed(index)
+            while length > 0_usize && byte != bytes.get_unchecked_borrowed(length) {
+                length = table.get_unchecked_borrowed(length - 1_usize)
+            }
+            if byte == bytes.get_unchecked_borrowed(length) {
+                length += 1_usize
+            }
+        }
+        table.push(length)
+        index += 1_usize
+    }
+    ret table
+}
+
+fn prefix_at(regex: Regex, text: str, start: usize) -> usize {
+    if regex.prefix.len() == 0_usize {
+        ret start
+    }
+    let mut index = start
+    let mut length = 0_usize
+    let first = regex.prefix.get_unchecked_borrowed(0_usize)
+    while index < text.byte_len() {
+        // KMP still bounds the work for overlapping prefixes. With no partial
+        // prefix, let the runtime skip bytes in one call instead of one call
+        // per byte. A non-ASCII UTF-8 leading byte is unaffected by ASCII fold.
+        if length == 0_usize &&(!regex.options.ignore_case || first < 97_u8 || first > 122_u8) {
+            index = text.find_byte_from(first, index)
+            if index == text.byte_len() {
+                break
+            }
+        }
+        let mut byte = text.byte_at(index)
+        if regex.options.ignore_case {
+            byte = fold(byte)
+        }
+        while length > 0_usize && byte != regex.prefix.get_unchecked_borrowed(length) {
+            length = regex.failure.get_unchecked_borrowed(length - 1_usize)
+        }
+        if byte == regex.prefix.get_unchecked_borrowed(length) {
+            length += 1_usize
+        }
+        index += 1_usize
+        if length == regex.prefix.len() {
+            ret index - length
+        }
+    }
+    // A missing prefix must be distinguishable from a match at EOF.
+    ret text.byte_len() + 1_usize
+}
+
+fn starting_set(program: Vec[Inst], classes: Vec[CharClass], entry: usize) -> StartSet {
+    let mut out = StartSet { 0_u32, 0_u32, 0_u32, 0_u32, false, false }
+    let mut seen = Vec[bool]::with_capacity(program.len())
+    let mut index = 0_usize
+    while index < program.len() {
+        seen.push(false) index += 1_usize
+    }
+    let mut stack = Vec[usize]::new()
+    stack.push(entry)
+    while stack.len() > 0_usize {
+        let pc = stack.pop().unwrap_or(entry)
+        if !seen.get_unchecked_borrowed(pc) {
+            seen.set(pc, true)
+            let inst = program.get_unchecked_borrowed(pc)
+            if inst.kind == 0_usize {
+                out.nullable = true
+            } elif inst.kind == 1_usize {
+                let class = classes.get_unchecked_borrowed(inst.a)
+                out.mask0 = out.mask0 | class.mask0
+                out.mask1 = out.mask1 | class.mask1
+                out.mask2 = out.mask2 | class.mask2
+                out.mask3 = out.mask3 | class.mask3
+                if class.ranges.len() > 0_usize &&
+                class.ranges.get_unchecked_borrowed(class.ranges.len() - 1_usize).high >= 128_usize {
+                    out.non_ascii = true
+                }
+            } elif inst.kind == 2_usize {
+                out.mask0 = 4294967295_u32
+                out.mask1 = 4294967295_u32
+                out.mask2 = 4294967295_u32
+                out.mask3 = 4294967295_u32
+                out.non_ascii = true
+            } elif inst.kind == 3_usize {
+                stack.push(inst.b)
+            } else {
+                stack.push(inst.b) stack.push(inst.a)
+            }
+        }
+    }
+    ret out
+}
+
+fn first_at(first: StartSet, text: str, start: usize) -> usize {
+    if first.nullable {
+        ret start
+    }
+    let mut position = start
+    while position < text.byte_len() {
+        let byte = text.byte_at(position) as usize
+        if byte < 128_usize {
+            let mut mask = first.mask0
+            if byte >= 96_usize {
+                mask = first.mask3
+            } elif byte >= 64_usize {
+                mask = first.mask2
+            } elif byte >= 32_usize {
+                mask = first.mask1
+            }
+            if (mask &(1_u32 <<(byte % 32_usize))) != 0_u32 {
+                ret position
+            }
+            position += 1_usize
+        } else {
+            if first.non_ascii {
+                ret position
+            }
+            position = decode(text, position).1
+        }
+    }
+    ret text.byte_len() + 1_usize
+}
+
+impl for Regex {
+    pub fn new(pattern: str) -> Result[Self, RegexError] {
+        ret Self::with_options(pattern, RegexOptions::new())
+    }
+
+    pub fn with_options(pattern: str, options: RegexOptions) -> Result[Self, RegexError] {
+        if pattern.byte_len() > 65536_usize {
+            ret Result::Err(error("pattern exceeds 64 KiB", 65536_usize))
+        }
+        let mut parser = Parser<H> {
+            pattern, 0_usize, 0_usize, options, Vec[Ast]::new(), Vec[CharClass]::new()
+        }
+        let root = parser.alternative()?
+        if parser.cursor != pattern.byte_len() {
+            ret Result::Err(error("unexpected closing parenthesis", parser.cursor))
+        }
+        let prefix = literal_prefix(parser.nodes, root, options.ignore_case)
+        let code = compile(parser.nodes, root)
+        ret Result::Ok(Self {
+                code.0, parser.classes, code.1, options, prefix.0, failure_table(prefix.0), prefix.1,
+                starting_set(code.0, parser.classes, code.1)
+            }
+        )
+    }
+
+    pub fn matcher(self: Self) -> Matcher<H> {
+        let mut count = self.program.len()
+        if self.literal_only {
+            count = 0_usize
+        }
+        let mut seen = Vec[usize]::with_capacity(count)
+        let mut index = 0_usize
+        while index < count {
+            seen.push(0_usize) index += 1_usize
+        }
+        ret Matcher<H> {
+            self, Vec[Thread]::with_capacity(count), Vec[Thread]::with_capacity(count),
+            Vec[Thread]::with_capacity(count * 2_usize), seen, 0_usize
+        }
+    }
+
+    pub fn is_match(self: Self, text: str) -> bool {
+        let mut workspace = self.matcher()
+        ret workspace.is_match(text)
+    }
+
+    pub fn find(self: Self, text: str) -> Option[Match] {
+        let mut workspace = self.matcher()
+        ret workspace.find(text)
+    }
+
+    pub fn full_match(self: Self, text: str) -> bool {
+        let mut workspace = self.matcher()
+        ret workspace.full_match(text)
+    }
+
+    pub fn find_iter(self: Self, text: str) -> FindIter {
+        ret FindIter { self.matcher(), text, 0_usize, false }
+    }
+}
+
+fn assertion(kind: usize, options: RegexOptions, text: str, position: usize) -> bool {
+    let size = text.byte_len()
+    if kind == 0_usize {
+        ret position == 0_usize ||(options.multi_line && position > 0_usize && text.byte_at(position - 1_usize) == 10_u8)
+    }
+    if kind == 1_usize {
+        ret position == size ||(options.multi_line && position < size && text.byte_at(position) == 10_u8)
+    }
+    if kind == 2_usize {
+        ret position == 0_usize
+    }
+    if kind == 3_usize {
+        ret position == size
+    }
+    let before = position > 0_usize && word(text.byte_at(position - 1_usize))
+    let after = position < size && word(text.byte_at(position))
+    if kind == 4_usize {
+        ret before != after
+    }
+    ret before == after
+}
+
+impl for Matcher {
+    fn tick(self: mut Self&) ->() {
+        // Reset before overflow, also on 32-bit targets.
+        if self.generation >= 4000000000_usize {
+            let mut index = 0_usize
+            while index < self.seen.len() {
+                self.seen.set(index, 0_usize) index += 1_usize
+            }
+            self.generation = 0_usize
+        }
+        self.generation += 1_usize
+    }
+
+    fn closure(self: mut Self&, pc: usize, start: usize, text: str, position: usize, into_next: bool) ->() {
+        self.stack.push(Thread { pc, start })
+        while self.stack.len() > 0_usize {
+            let state = self.stack.pop().unwrap_or(Thread { 0_usize, 0_usize })
+            if self.seen.get_unchecked_borrowed(state.pc) != self.generation {
+                self.seen.set(state.pc, self.generation)
+                let inst = self.regex.program.get_unchecked_borrowed(state.pc)
+                if inst.kind == 4_usize {
+                    self.stack.push(Thread { inst.b, state.start })
+                    self.stack.push(Thread { inst.a, state.start })
+                } elif inst.kind == 3_usize {
+                    if assertion(inst.a, self.regex.options, text, position) {
+                        self.stack.push(Thread { inst.b, state.start })
+                    }
+                } elif into_next {
+                    self.next.push(state)
+                } else {
+                    self.current.push(state)
+                }
+            }
+        }
+    }
+
+    fn search(self: mut Self&, text: str, from: usize, full: bool, existence: bool) -> Option[Match] {
+        let size = text.byte_len()
+        if from > size {
+            ret Option[Match]::None
+        }
+        if self.regex.literal_only {
+            if full {
+                if self.regex.prefix.len() != size {
+                    ret Option[Match]::None
+                }
+            }
+            let found = prefix_at(self.regex, text, from)
+            if found > size ||(full && found != 0_usize) {
+                ret Option[Match]::None
+            }
+            ret Option[Match]::Some(Match { text, found, found + self.regex.prefix.len() })
+        }
+        self.current.clear()
+        self.next.clear()
+        self.stack.clear()
+        self.tick()
+        let mut position = from
+        let mut best = false
+        let mut best_start = 0_usize
+        let mut best_end = 0_usize
+        loop {
+            if !best &&(!full || position == 0_usize) {
+                if !full && self.current.len() == 0_usize {
+                    let mut candidate = position
+                    if self.regex.prefix.len() > 0_usize {
+                        candidate = prefix_at(self.regex, text, position)
+                    } else {
+                        candidate = first_at(self.regex.first, text, position)
+                    }
+                    if candidate != position {
+                        self.tick()
+                    }
+                    position = candidate
+                    if position > size {
+                        break
+                    }
+                }
+                self.closure(self.regex.entry, position, text, position, false)
+            }
+            let scalar = decode(text, position)
+            self.tick()
+            self.next.clear()
+            let mut index = 0_usize
+            while index < self.current.len() {
+                let state = self.current.get_unchecked_borrowed(index)
+                let inst = self.regex.program.get_unchecked_borrowed(state.pc)
+                if inst.kind == 0_usize {
+                    if !full ||(state.start == 0_usize && position == size) {
+                        if existence {
+                            ret Option[Match]::Some(Match { text, state.start, position })
+                        }
+                        best = true
+                        best_start = state.start
+                        best_end = position
+                        break
+                    }
+                } elif position < size {
+                    let mut accepts = false
+                    if inst.kind == 1_usize {
+                        accepts = class_matches(self.regex.classes.get_unchecked_borrowed(inst.a), scalar.0)
+                    } elif inst.kind == 2_usize {
+                        accepts = self.regex.options.dot_matches_new_line || scalar.0 != 10_usize
+                    }
+                    if accepts {
+                        self.closure(inst.b, state.start, text, scalar.1, true)
+                    }
+                }
+                index += 1_usize
+            }
+            if position >= size ||(self.next.len() == 0_usize &&(best || full)) {
+                break
+            }
+            let old = self.current
+            self.current = self.next
+            self.next = old
+            position = scalar.1
+        }
+        if best {
+            ret Option[Match]::Some(Match { text, best_start, best_end })
+        }
+        ret Option[Match]::None
+    }
+
+    pub fn is_match(self: mut Self&, text: str) -> bool {
+        ret self.search(text, 0_usize, false, true).is_some()
+    }
+
+    pub fn find(self: mut Self&, text: str) -> Option[Match] {
+        ret self.search(text, 0_usize, false, false)
+    }
+
+    pub fn full_match(self: mut Self&, text: str) -> bool {
+        ret self.search(text, 0_usize, true, true).is_some()
+    }
+
+    /// Searches from a byte offset, preserving the input's anchor context.
+    /// Returns None for an out-of-range offset or a UTF-8 continuation byte.
+    pub fn find_from(self: mut Self&, text: str, from: usize) -> Option[Match] {
+        if from < text.byte_len() {
+            let byte = text.byte_at(from)
+            if byte >= 128_u8 && byte < 192_u8 {
+                ret Option[Match]::None
+            }
+        }
+        ret self.search(text, from, false, false)
+    }
+}
+
+impl for FindIter {
+    fn take_workspace(self: Self) -> Matcher<H> {
+        ret self.workspace
+    }
+
+    pub fn next(self: Self) ->(Self, Option[Match]) {
+        if self.finished {
+            ret(self, Option[Match]::None)
+        }
+        let mut workspace = self.take_workspace()
+        let result = workspace.find_from(self.text, self.cursor)
+        match result {
+            Option::Some(found) => {
+                let mut cursor = found.last
+                let mut finished = false
+                if found.first == found.last {
+                    if cursor == self.text.byte_len() {
+                        finished = true
+                    } else {
+                        cursor = decode(self.text, cursor).1
+                    }
+                }
+                ret(Self { workspace, self.text, cursor, finished }, Option[Match]::Some(found))
+            }
+            Option::None => {
+                ret(Self { workspace, self.text, self.cursor, true }, Option[Match]::None)
+            }
+        }
+    }
+
+    pub fn into_iter(self: Self) -> Self {
+        ret self
+    }
+}
+
+impl Iterator[Match] for FindIter {
+    pub fn next(self: Self) ->(Self, Option[Match]) {
+        ret FindIter::next(self)
+    }
+}
+
+impl IntoIterator[Match, FindIter] for FindIter {
+    pub fn into_iter(self: Self) -> Self {
+        ret self
+    }
+}
